@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Experiment 2: Double Pendulum PEML -- real experimental data.
+Double Pendulum PEML -- RK4 trajectory matching with multiple shooting.
 
-Uses the MultiArm-Pendulum dataset (Kaheman et al., 2022).
-Identifies physical parameters + learns nonlinear friction from data.
+Key insight from the original MATLAB repo: train by integrating trajectory
+segments and comparing L2 norm with measured data. We use:
+  - Custom RK4 integrator (differentiable, fixed dt=0.01)
+  - Multiple shooting: 0.2s windows from random positions in training data
+  - Physics fixed from paper, NN learns friction + unmodeled effects
 """
 
 import os
@@ -17,8 +20,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
 
-from double_pendulum_data import prepare_dataset, PAPER_PARAMS
-from double_pendulum_model import DoublePendulumHybridModel
+from double_pendulum_data import PAPER_PARAMS
+from models import NeuralNetwork
 
 if sys.stdout.encoding != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
@@ -27,273 +30,240 @@ RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results'
 os.makedirs(RESULTS_DIR, exist_ok=True)
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-
-# -----------------------------------------------
-# 1. Data
-# -----------------------------------------------
-def prepare_tensors():
-    train_np, val_np = prepare_dataset(
-        train_indices=(1, 2, 3), val_index=4,
-        subsample_factor=10, smooth_window=7,
-    )
-
-    def to_tensors(d):
-        out = {k: torch.tensor(v, dtype=torch.float32, device=DEVICE)
-               for k, v in d.items() if isinstance(v, np.ndarray)}
-        out['dt'] = d['dt']  # keep scalar
-        return out
-
-    return to_tensors(train_np), to_tensors(val_np), train_np, val_np
+DT_INTEGRATE = 0.01  # RK4 step size (100 Hz)
+WINDOW_STEPS = 20    # 0.2s windows
+WINDOW_SEC = WINDOW_STEPS * DT_INTEGRATE
 
 
 # -----------------------------------------------
-# 2. Training
+# 1. ODE model
 # -----------------------------------------------
-def train_model(model, train, batch_size=2048):
-    """
-    Single-step prediction training (no finite-difference accelerations needed).
+class DoublePendulumODE(nn.Module):
+    def __init__(self, nn_hidden=2, nn_neurons=32):
+        super().__init__()
+        self.m1 = PAPER_PARAMS['m1']
+        self.m2 = PAPER_PARAMS['m2']
+        self.a1 = PAPER_PARAMS['a1']
+        self.a2 = PAPER_PARAMS['a2']
+        self.L1 = PAPER_PARAMS['L1']
+        self.I1 = PAPER_PARAMS['I1']
+        self.I2 = PAPER_PARAMS['I2']
+        self.g  = PAPER_PARAMS['g']
+        self.nn_friction = NeuralNetwork(4, 2, nn_hidden, nn_neurons)
 
-    Instead of fitting residuals M*ddq + C*dq + G = -friction, we:
-      1. Predict ddq from model at time t
-      2. Semi-implicit Euler: dq(t+dt) = dq(t) + ddq*dt, q(t+dt) = q(t) + dq(t+dt)*dt
-      3. Compare predicted (q, dq) at t+dt with actual measurements
+    def forward(self, t, y):
+        th1, th2, dth1, dth2 = y[..., 0], y[..., 1], y[..., 2], y[..., 3]
+        m1, m2, a1, a2, L1 = self.m1, self.m2, self.a1, self.a2, self.L1
+        I1, I2, g = self.I1, self.I2, self.g
 
-    Two phases:
-      Phase 1: Physics only (NN frozen) -- 3000 epochs
-      Phase 2: Joint physics + NN -- 5000 epochs with NN regularization
-    """
-    # Build consecutive pairs: (state_t, state_{t+1})
-    th1 = train['theta1']
-    th2 = train['theta2']
-    dth1 = train['dtheta1']
-    dth2 = train['dtheta2']
-    dt = train['dt'] * 10  # subsampled dt (0.01s)
-    n = len(th1) - 1  # pairs
+        cd = torch.cos(th1 - th2)
+        sd = torch.sin(th1 - th2)
 
-    def step_loss(idx, nn_reg=0.0):
-        """Compute single-step prediction loss for batch indices."""
-        # Current state
-        t1 = th1[idx]; t2 = th2[idx]; d1 = dth1[idx]; d2 = dth2[idx]
-        # Next state (ground truth)
-        t1_next = th1[idx + 1]; t2_next = th2[idx + 1]
-        d1_next = dth1[idx + 1]; d2_next = dth2[idx + 1]
+        M11 = I1 + I2 + m1*a1**2 + m2*(L1**2 + a2**2) + 2*m2*L1*a2*cd
+        M12 = I2 + m2*a2**2 + m2*L1*a2*cd
+        M22 = I2 + m2*a2**2
 
-        # Predict acceleration
-        dd1, dd2 = model.predict_accel(t1, t2, d1, d2)
+        c1 = -m2*L1*a2*sd*(2*dth1*dth2 + dth2**2)
+        c2 =  m2*L1*a2*sd*dth1**2
+        g1 = (m1*a1 + m2*L1)*g*torch.sin(th1)
+        g2 = m2*a2*g*torch.sin(th2)
 
-        # Semi-implicit Euler integration
-        d1_pred = d1 + dd1 * dt
-        d2_pred = d2 + dd2 * dt
-        t1_pred = t1 + d1_pred * dt
-        t2_pred = t2 + d2_pred * dt
+        nn_in = torch.stack([th1, th2, dth1, dth2], dim=-1)
+        tau_nn = self.nn_friction(nn_in)
 
-        # Loss: prediction error on (theta, dtheta)
-        loss = (torch.mean((t1_pred - t1_next)**2 + (t2_pred - t2_next)**2)
-                + 0.01 * torch.mean((d1_pred - d1_next)**2 + (d2_pred - d2_next)**2))
+        rhs1 = -(c1 + g1 + tau_nn[..., 0])
+        rhs2 = -(c2 + g2 + tau_nn[..., 1])
 
-        if nn_reg > 0:
-            nn_input = torch.stack([t1, t2, d1, d2], dim=-1)
-            tau_nn = model.nn_friction(nn_input)
-            loss = loss + nn_reg * torch.mean(tau_nn**2)
+        det = M11*M22 - M12*M12
+        ddth1 = (M22*rhs1 - M12*rhs2) / det
+        ddth2 = (-M12*rhs1 + M11*rhs2) / det
 
-        return loss
+        return torch.stack([dth1, dth2, ddth1, ddth2], dim=-1)
 
-    def run_phase(params, n_epochs, lr, label, nn_reg=0.0):
-        optimizer = torch.optim.Adam(params, lr=lr)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=n_epochs, eta_min=1e-6)
-        phase_losses = []
-        for epoch in range(n_epochs):
-            model.train()
-            idx = torch.randint(0, n, (batch_size,), device=DEVICE)
+
+def rk4_integrate(model, y0, dt, n_steps):
+    y = y0
+    traj = [y]
+    t = torch.tensor(0.0, device=y0.device)
+    for _ in range(n_steps):
+        k1 = model(t, y)
+        k2 = model(t + dt/2, y + dt/2 * k1)
+        k3 = model(t + dt/2, y + dt/2 * k2)
+        k4 = model(t + dt, y + dt * k3)
+        y = y + (dt/6) * (k1 + 2*k2 + 2*k3 + k4)
+        t = t + dt
+        traj.append(y)
+    return torch.stack(traj)  # (n_steps+1, 4)
+
+
+# -----------------------------------------------
+# 2. Data
+# -----------------------------------------------
+def load_data():
+    import scipy.io as sio
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            '..', 'multi-pendulum-data', 'ParameterEstimation', 'DoublePendulum')
+    d = sio.loadmat(os.path.join(data_dir, 'DoublePendulumDataForParameterEstimation.mat'))
+    dt_raw = d['dt'].item()  # 0.001
+
+    def extract(Y_cell):
+        segs = []
+        for i in range(Y_cell.shape[0]):
+            seg = Y_cell[i, 0].T  # (T, 4)
+            # Subsample to 100Hz for RK4 dt=0.01
+            seg_100hz = seg[::10]
+            segs.append(torch.tensor(seg_100hz, dtype=torch.float32, device=DEVICE))
+        return segs
+
+    train_segs = extract(d['Y_id'])
+    val_segs = extract(d['Y_vad'])
+    print(f"  {len(train_segs)} train + {len(val_segs)} val segments")
+    print(f"  Segment length: {train_segs[0].shape[0]} steps at 100Hz = {train_segs[0].shape[0]*DT_INTEGRATE:.1f}s")
+    return train_segs, val_segs
+
+
+# -----------------------------------------------
+# 3. Training: multiple shooting with RK4
+# -----------------------------------------------
+def train(model, train_segs, n_epochs=2000, lr=1e-3, windows_per_epoch=6):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs, eta_min=1e-5)
+
+    # Pre-compute all valid window starting indices
+    all_windows = []
+    for seg in train_segs:
+        max_start = seg.shape[0] - WINDOW_STEPS - 1
+        for s in range(0, max_start, WINDOW_STEPS // 2):  # 50% overlap
+            all_windows.append((seg, s))
+    print(f"  Total windows: {len(all_windows)} ({WINDOW_SEC}s each)")
+
+    losses = []
+    for epoch in range(n_epochs):
+        model.train()
+        epoch_loss = 0.0
+
+        # Random sample of windows
+        idxs = np.random.choice(len(all_windows), windows_per_epoch, replace=False)
+
+        for idx in idxs:
+            seg, start = all_windows[idx]
+            gt = seg[start:start + WINDOW_STEPS + 1]  # (21, 4)
+            y0 = gt[0]
+
             optimizer.zero_grad()
-            loss = step_loss(idx, nn_reg=nn_reg)
+            pred = rk4_integrate(model, y0, DT_INTEGRATE, WINDOW_STEPS)
+            loss = torch.mean((pred - gt)**2)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            scheduler.step()
-            phase_losses.append(loss.item())
-            if (epoch + 1) % 500 == 0:
-                cur_lr = scheduler.get_last_lr()[0]
-                print(f"  [{label}] Epoch {epoch+1:4d}/{n_epochs} | "
-                      f"Loss: {loss.item():.6e} | lr={cur_lr:.2e}")
-                print(f"    m1={model.m1.item():.5f} m2={model.m2.item():.5f} "
-                      f"a1={model.a1.item():.5f} a2={model.a2.item():.5f} "
-                      f"I1={model.I1.item():.6f} I2={model.I2.item():.6f}")
-        return phase_losses
+            epoch_loss += loss.item()
 
-    # Physics fixed, only train NN to learn friction + residual
-    print("  Training NN only (physics fixed from paper)...")
-    nn_params = list(model.nn_friction.parameters())
-    losses = run_phase(nn_params, n_epochs=6000, lr=1e-3, label="NN", nn_reg=0.0)
+        scheduler.step()
+        avg = epoch_loss / windows_per_epoch
+        losses.append(avg)
+
+        if (epoch + 1) % 200 == 0:
+            lr_now = scheduler.get_last_lr()[0]
+            print(f"  Epoch {epoch+1:4d}/{n_epochs} | Loss: {avg:.6e} | lr={lr_now:.2e}")
 
     return losses
 
 
 # -----------------------------------------------
-# 3. Evaluation
+# 4. Evaluation
 # -----------------------------------------------
-def evaluate(model, data):
+def predict_long(model, y0, duration_s):
+    n_steps = int(duration_s / DT_INTEGRATE)
     model.eval()
     with torch.no_grad():
-        res1, res2, tau1_nn, tau2_nn = model(
-            data['theta1'], data['theta2'],
-            data['dtheta1'], data['dtheta2'],
-            data['ddtheta1'], data['ddtheta2'],
-        )
-    return {
-        'res1': res1.cpu().numpy(),
-        'res2': res2.cpu().numpy(),
-        'tau1_nn': tau1_nn.cpu().numpy(),
-        'tau2_nn': tau2_nn.cpu().numpy(),
-    }
+        traj = rk4_integrate(model, y0, DT_INTEGRATE, n_steps)
+    return traj.cpu().numpy()
 
 
-def forward_integrate(model, y0, t_span, t_eval):
-    """Integrate the identified model forward in time."""
-    model.eval()
+def physics_only_predict(y0_np, duration_s):
+    P = PAPER_PARAMS
 
     def rhs(t, y):
         th1, th2, dth1, dth2 = y
-        with torch.no_grad():
-            t_th1 = torch.tensor([th1], dtype=torch.float32, device=DEVICE)
-            t_th2 = torch.tensor([th2], dtype=torch.float32, device=DEVICE)
-            t_dth1 = torch.tensor([dth1], dtype=torch.float32, device=DEVICE)
-            t_dth2 = torch.tensor([dth2], dtype=torch.float32, device=DEVICE)
-            ddth1, ddth2 = model.predict_accel(t_th1, t_th2, t_dth1, t_dth2)
-        return [dth1, dth2, ddth1.item(), ddth2.item()]
+        m1, m2, a1, a2, L1 = P['m1'], P['m2'], P['a1'], P['a2'], P['L1']
+        I1, I2, g, k1, k2 = P['I1'], P['I2'], P['g'], P['k1'], P['k2']
+        cd, sd = np.cos(th1-th2), np.sin(th1-th2)
+        M11 = I1+I2+m1*a1**2+m2*(L1**2+a2**2)+2*m2*L1*a2*cd
+        M12 = I2+m2*a2**2+m2*L1*a2*cd
+        M22 = I2+m2*a2**2
+        c1 = -m2*L1*a2*sd*(2*dth1*dth2+dth2**2)
+        c2 = m2*L1*a2*sd*dth1**2
+        g1 = (m1*a1+m2*L1)*g*np.sin(th1)
+        g2 = m2*a2*g*np.sin(th2)
+        f1 = k1*dth1+k2*(dth1-dth2)
+        f2 = k2*(dth2-dth1)
+        det = M11*M22-M12**2
+        return [dth1, dth2, (M22*(-(c1+g1+f1))-M12*(-(c2+g2+f2)))/det,
+                (-M12*(-(c1+g1+f1))+M11*(-(c2+g2+f2)))/det]
 
-    sol = solve_ivp(rhs, t_span, y0, t_eval=t_eval,
-                    method='RK45', rtol=1e-8, atol=1e-10, max_step=0.01)
-    return sol
+    t_eval = np.arange(0, duration_s, DT_INTEGRATE)
+    sol = solve_ivp(rhs, [0, duration_s], y0_np, t_eval=t_eval, method='DOP853', rtol=1e-8, atol=1e-10)
+    return sol.y.T
 
 
 # -----------------------------------------------
-# 4. Visualization
+# 5. Plots
 # -----------------------------------------------
-def plot_training_loss(losses):
+def plot_loss(losses):
     fig, ax = plt.subplots(figsize=(8, 4))
-    ax.semilogy(losses, alpha=0.15, color='C0', linewidth=0.5)
-    alpha_ema = 0.01
+    ax.semilogy(losses, alpha=0.2, color='C0', linewidth=0.5)
     ema = [losses[0]]
     for l in losses[1:]:
-        ema.append(alpha_ema * l + (1 - alpha_ema) * ema[-1])
-    ax.semilogy(ema, color='C0', linewidth=1.5, label='Smoothed (EMA)')
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('Residual Loss')
-    ax.set_title('Double Pendulum -- Training Loss')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(os.path.join(RESULTS_DIR, 'training_loss.png'), dpi=150)
-    plt.close(fig)
+        ema.append(0.02*l + 0.98*ema[-1])
+    ax.semilogy(ema, color='C0', linewidth=1.5, label='EMA')
+    ax.set_xlabel('Epoch'); ax.set_ylabel('MSE'); ax.set_title('Training Loss')
+    ax.legend(); ax.grid(True, alpha=0.3)
+    fig.tight_layout(); fig.savefig(os.path.join(RESULTS_DIR, 'training_loss.png'), dpi=150); plt.close(fig)
 
 
-def plot_residual_histogram(eval_result):
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    for ax, key, label in [(axes[0], 'res1', 'Joint 1'), (axes[1], 'res2', 'Joint 2')]:
-        r = eval_result[key]
-        mu, sigma = np.mean(r), np.std(r)
-        ax.hist(r, bins=100, color='steelblue', edgecolor='white', linewidth=0.3)
-        ax.set_title(f'{label} residual: mu={mu:.4e}, sigma={sigma:.4e}')
-        ax.set_xlabel('Residual torque [Nm]')
-        ax.set_ylabel('Count')
-        ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(os.path.join(RESULTS_DIR, 'residual_histogram.png'), dpi=150)
-    plt.close(fig)
+def plot_trajectory(model, val_segs, seg_idx=0):
+    seg = val_segs[seg_idx]
+    duration = seg.shape[0] * DT_INTEGRATE
+    seg_np = seg.cpu().numpy()
+    y0 = seg[0]
+    y0_np = y0.cpu().numpy()
+    t_np = np.arange(seg.shape[0]) * DT_INTEGRATE
+
+    y_hybrid = predict_long(model, y0, duration - DT_INTEGRATE)
+    y_physics = physics_only_predict(y0_np, duration)
+
+    labels = ['theta1 (rad)', 'theta2 (rad)', 'omega1 (rad/s)', 'omega2 (rad/s)']
+    fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
+    for i, (ax, lbl) in enumerate(zip(axes, labels)):
+        ax.plot(t_np, seg_np[:, i], 'C0', linewidth=1.2, label='Measured')
+        n_ph = min(len(t_np), y_physics.shape[0])
+        ax.plot(t_np[:n_ph], y_physics[:n_ph, i], 'C1--', linewidth=0.8, alpha=0.7, label='Physics Only')
+        n_hy = min(len(t_np), y_hybrid.shape[0])
+        ax.plot(t_np[:n_hy], y_hybrid[:n_hy, i], 'C2', linewidth=1.0, alpha=0.9, label='Hybrid')
+        ax.set_ylabel(lbl); ax.grid(True, alpha=0.3)
+        if i == 0: ax.legend(ncol=3)
+    axes[-1].set_xlabel('time (s)')
+    fig.suptitle(f'Validation trajectory {seg_idx+1}: full-time comparison')
+    fig.tight_layout(); fig.savefig(os.path.join(RESULTS_DIR, 'forward_dynamics.png'), dpi=150); plt.close(fig)
 
 
-def plot_nn_friction(eval_result, val_np):
-    """Plot the learned friction torques vs angular velocity."""
+def plot_friction(model):
+    model.eval()
+    dth = np.linspace(-8, 8, 200)
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-
-    for ax, dth_key, tau_key, label in [
-        (axes[0], 'dtheta1', 'tau1_nn', 'Joint 1'),
-        (axes[1], 'dtheta2', 'tau2_nn', 'Joint 2'),
-    ]:
-        dth = val_np[dth_key]
-        tau = eval_result[tau_key]
-        # Subsample for scatter plot
-        idx = np.random.choice(len(dth), min(5000, len(dth)), replace=False)
-        ax.scatter(dth[idx], tau[idx], s=1, alpha=0.3, c='C0')
-        ax.set_xlabel('Angular velocity [rad/s]')
-        ax.set_ylabel('NN friction torque [Nm]')
-        ax.set_title(f'{label} -- Learned friction')
-        ax.grid(True, alpha=0.3)
-        ax.axhline(0, color='gray', linewidth=0.5)
-        ax.axvline(0, color='gray', linewidth=0.5)
-
-    fig.tight_layout()
-    fig.savefig(os.path.join(RESULTS_DIR, 'nn_friction.png'), dpi=150)
-    plt.close(fig)
-
-
-def plot_forward_dynamics(model, val_np, duration=5.0):
-    """Compare forward integration vs actual trajectory."""
-    # Take first 'duration' seconds of validation data
-    dt_val = val_np['dt'] * 10  # subsampled dt
-    n_steps = int(duration / dt_val)
-    t_actual = val_np['t'][:n_steps]
-    t_actual = t_actual - t_actual[0]  # start at 0
-
-    y0 = [val_np['theta1'][0], val_np['theta2'][0],
-          val_np['dtheta1'][0], val_np['dtheta2'][0]]
-
-    sol = forward_integrate(model, y0, [0, duration], t_actual)
-
-    fig, axes = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
-
-    axes[0].plot(t_actual, val_np['theta1'][:n_steps], 'C1', linewidth=1.2, label='Actual')
-    axes[0].plot(sol.t, sol.y[0], 'C0--', linewidth=1.0, label='Hybrid Model')
-    axes[0].set_ylabel('theta1 [rad]')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
-
-    axes[1].plot(t_actual, val_np['theta2'][:n_steps], 'C1', linewidth=1.2, label='Actual')
-    axes[1].plot(sol.t, sol.y[1], 'C0--', linewidth=1.0, label='Hybrid Model')
-    axes[1].set_ylabel('theta2 [rad]')
-    axes[1].set_xlabel('t [s]')
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
-
-    fig.suptitle(f'Forward dynamics ({duration}s) -- actual vs identified HM')
-    fig.tight_layout()
-    fig.savefig(os.path.join(RESULTS_DIR, 'forward_dynamics.png'), dpi=150)
-    plt.close(fig)
-
-
-def plot_param_comparison(model):
-    """Compare identified vs paper-estimated parameters."""
-    def _get(name):
-        prop = getattr(model, name)
-        return prop.item() if isinstance(prop, torch.Tensor) else prop
-    params = {n: (_get(n), PAPER_PARAMS[n])
-              for n in ['m1', 'm2', 'a1', 'a2', 'L1', 'I1', 'I2', 'g']}
-
-    names = list(params.keys())
-    ours = [params[n][0] for n in names]
-    paper = [params[n][1] for n in names]
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    x = np.arange(len(names))
-    width = 0.35
-    ax.bar(x - width/2, ours, width, label='PEML (ours)', color='C0')
-    ax.bar(x + width/2, paper, width, label='Paper estimate', color='C1')
-    ax.set_xticks(x)
-    ax.set_xticklabels(names)
-    ax.set_ylabel('Parameter value')
-    ax.set_title('Identified parameters: PEML vs original paper')
-    ax.legend()
-    ax.grid(True, alpha=0.3, axis='y')
-
-    # Add value labels
-    for i, (o, p) in enumerate(zip(ours, paper)):
-        ax.text(i - width/2, o, f'{o:.5f}', ha='center', va='bottom', fontsize=7)
-        ax.text(i + width/2, p, f'{p:.5f}', ha='center', va='bottom', fontsize=7)
-
-    fig.tight_layout()
-    fig.savefig(os.path.join(RESULTS_DIR, 'param_comparison.png'), dpi=150)
-    plt.close(fig)
+    for ax, ji, lbl in [(axes[0], 0, 'Joint 1'), (axes[1], 1, 'Joint 2')]:
+        tau = []
+        for v in dth:
+            inp = torch.tensor([[np.pi, np.pi, v if ji==0 else 0, 0 if ji==0 else v]],
+                               dtype=torch.float32, device=DEVICE)
+            with torch.no_grad():
+                tau.append(model.nn_friction(inp)[0, ji].item())
+        ax.plot(dth, tau, 'C0', linewidth=2)
+        k = PAPER_PARAMS[f'k{ji+1}']
+        ax.plot(dth, k*dth, 'C1--', linewidth=1.5, label=f'Linear (k={k:.6f})')
+        ax.set_xlabel('Angular velocity (rad/s)'); ax.set_ylabel('Friction torque (Nm)')
+        ax.set_title(f'{lbl} -- Learned friction'); ax.legend(); ax.grid(True, alpha=0.3)
+    fig.tight_layout(); fig.savefig(os.path.join(RESULTS_DIR, 'nn_friction.png'), dpi=150); plt.close(fig)
 
 
 # -----------------------------------------------
@@ -301,65 +271,26 @@ def plot_param_comparison(model):
 # -----------------------------------------------
 def main():
     print("=" * 60)
-    print("PEML -- Double Pendulum (real experimental data)")
+    print("PEML Double Pendulum -- RK4 trajectory matching")
     print("=" * 60)
 
-    # 1. Data
-    train, val, train_np, val_np = prepare_tensors()
-    print(f"  Train: {len(train['theta1'])} samples")
-    print(f"  Val:   {len(val['theta1'])} samples")
+    train_segs, val_segs = load_data()
 
-    # 2. Model
-    model = DoublePendulumHybridModel(nn_hidden=2, nn_neurons=32).to(DEVICE)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"  Model on: {DEVICE}, {total_params} parameters")
+    model = DoublePendulumODE(nn_hidden=2, nn_neurons=32).to(DEVICE)
+    print(f"  {sum(p.numel() for p in model.parameters())} params, device={DEVICE}")
 
-    # 3. Train
-    print(f"\nTraining NN only (6000 epochs, physics fixed)...")
-    losses = train_model(model, train, batch_size=2048)
+    print(f"\nTraining (RK4, {WINDOW_SEC}s windows, multiple shooting)...")
+    losses = train(model, train_segs, n_epochs=2000, lr=1e-3, windows_per_epoch=6)
 
-    # 4. Print identified parameters
-    print(f"\n{'='*60}")
-    print("Identified parameters vs paper:")
-    print("  All physics parameters fixed from paper estimates.")
-    print("  NN learns: nonlinear friction + unmodeled effects.")
-    print(f"{'='*60}")
-
-    # 5. Evaluate
-    print("\nEvaluating on validation set...")
-    eval_train = evaluate(model, train)
-    eval_val = evaluate(model, val)
-
-    # 6. Plots
+    print(f"\n  Final loss: {losses[-1]:.6e}")
     print("\nGenerating figures...")
+    plot_loss(losses); print("  [OK] Training loss")
+    plot_trajectory(model, val_segs); print("  [OK] Forward dynamics")
+    plot_friction(model); print("  [OK] NN friction")
 
-    plot_training_loss(losses)
-    print("  [OK] Training loss")
-
-    plot_residual_histogram(eval_val)
-    print("  [OK] Residual histogram")
-
-    plot_nn_friction(eval_val, val_np)
-    print("  [OK] NN friction curves")
-
-    plot_param_comparison(model)
-    print("  [OK] Parameter comparison")
-
-    plot_forward_dynamics(model, val_np, duration=5.0)
-    print("  [OK] Forward dynamics (5s)")
-
-    # 7. Save
-    ckpt_path = os.path.join(RESULTS_DIR, 'double_pendulum_model.pt')
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'losses': losses,
-        'params': {name: (getattr(model, name).item()
-                         if isinstance(getattr(model, name), torch.Tensor)
-                         else getattr(model, name))
-                   for name in ['m1', 'm2', 'a1', 'a2', 'L1', 'I1', 'I2', 'g']},
-    }, ckpt_path)
-    print(f"\n  Model saved to {ckpt_path}")
-    print(f"  Figures saved to {RESULTS_DIR}/")
+    torch.save({'model_state_dict': model.state_dict(), 'losses': losses},
+               os.path.join(RESULTS_DIR, 'double_pendulum_model.pt'))
+    print(f"  Saved to {RESULTS_DIR}/")
     print("Done.")
 
 
